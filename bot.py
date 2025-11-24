@@ -3,7 +3,6 @@ import os
 import re
 import shutil
 import pandas as pd
-from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -14,7 +13,6 @@ from telegram.ext import (
     filters,
 )
 
-load_dotenv()
 logging.basicConfig(level=logging.INFO)
 
 ASK_VALUE = range(1)
