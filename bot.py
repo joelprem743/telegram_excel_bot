@@ -20,7 +20,7 @@ user_file_cache = {}
 
 
 # -------------------------------------------------------
-# NORMALIZATION FUNCTION (with bracket-exclusion logic)
+# NORMALIZATION FUNCTION (fixed logic)
 # -------------------------------------------------------
 def normalize(text: str) -> str:
     if not isinstance(text, str):
@@ -28,9 +28,9 @@ def normalize(text: str) -> str:
 
     t = text.lower().strip()
 
-    # Reject "(2)" or "( 2 )"
-    if re.search(r'\(\s*\d+\s*\)', t):
-        return "__INVALID__"
+    # Remove brackets but preserve their contents
+    # "(10014283)" -> "10014283"
+    t = re.sub(r'[\(\)]', ' ', t)
 
     # Replace non-alphanumeric with space
     t = re.sub(r'[^a-z0-9]+', ' ', t)
@@ -86,16 +86,17 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     file_path = user_file_cache[user_id]
 
-    # temp folder path
     temp_dir = os.path.dirname(file_path)
 
     try:
-        # Pick the correct engine
-        engine = "openpyxl" if file_path.lower().endswith(".xlsx") else None
+        # ---------------------------
+        # FIXED ENGINE SELECTION
+        # ---------------------------
+        if file_path.lower().endswith(".xlsx"):
+            excel_data = pd.read_excel(file_path, sheet_name=None, engine="openpyxl")
+        else:
+            excel_data = pd.read_excel(file_path, sheet_name=None, engine="xlrd")
 
-        excel_data = pd.read_excel(file_path, sheet_name=None, engine=engine)
-
-        # Create output filename
         safe_name = make_safe_filename(value_input)
         output_path = f"{temp_dir}/{safe_name}.xlsx"
 
@@ -104,12 +105,9 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         for sheet, df in excel_data.items():
             df_norm = df.astype(str).applymap(normalize)
 
-            # Row matches if ANY normalized cell contains the search term
+            # Row matches if ANY cell contains the normalized search term
             mask = df_norm.apply(
-                lambda row: any(
-                    (cell != "__INVALID__") and (norm_value_input in cell)
-                    for cell in row
-                ),
+                lambda row: any(norm_value_input in cell for cell in row),
                 axis=1
             )
 
@@ -128,7 +126,6 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Error processing file: {str(e)}")
 
     finally:
-        # Cleanup user temp directory
         shutil.rmtree(temp_dir, ignore_errors=True)
 
     return ConversationHandler.END
