@@ -19,75 +19,55 @@ ASK_VALUE = range(1)
 user_file_cache = {}
 
 
-# -------------------------------------------------------
-# NORMALIZE: safe, consistent lowercase text
-# -------------------------------------------------------
+# Normalize text for pattern matching
 def normalize(text: str) -> str:
     if not isinstance(text, str):
         text = str(text)
-
     t = text.lower().strip()
-
-    # Remove parentheses but keep the contents
-    t = re.sub(r'[\(\)]', ' ', t)
-
-    # Replace non-alphanumeric with spaces
+    t = re.sub(r'[\(\)]', lambda m: ' ' if m.group() in '()' else m.group(), t)
     t = re.sub(r'[^a-z0-9]+', ' ', t)
-
-    # Collapse spaces
     t = re.sub(r'\s+', ' ', t).strip()
-
     return t
 
 
-# -------------------------------------------------------
-# Check if a '2' exists OUTSIDE parentheses in original text
-# -------------------------------------------------------
-def has_2_outside_brackets(original: str) -> bool:
-    if not isinstance(original, str):
-        original = str(original)
+# Detect a "2" outside parentheses
+def has_2_outside_brackets(original_text: str) -> bool:
+    if not isinstance(original_text, str):
+        original_text = str(original_text)
 
-    for match in re.finditer("2", original):
+    for match in re.finditer("2", original_text):
         idx = match.start()
-        open_before = original[:idx].count("(")
-        close_before = original[:idx].count(")")
-        if open_before == close_before:  # only true if outside parentheses
+        open_before = original_text[:idx].count("(")
+        close_before = original_text[:idx].count(")")
+        if open_before == close_before:
             return True
-
     return False
 
 
-# -------------------------------------------------------
-# STRICT EXACT MATCH LOGIC
-# -------------------------------------------------------
-def is_exact_valid_cell(original_cell: str, normalized_cell: str) -> bool:
-    # Must contain a '2' outside parentheses
+# EXACT strict cell match using flexible patterns
+def matches_strict_pattern(original_cell: str, normalized_cell: str) -> bool:
+
     if not has_2_outside_brackets(original_cell):
         return False
 
-    # Strict regex patterns (exact entire cell match)
     patterns = [
-        r"^avanigadda-? ?2$",            # avanigadda2, avanigadda 2, avanigadda-2
-        r"^sc-? ?avanigadda-? ?2$",      # sc avanigadda 2, scavanigadda2, sc-avanigadda-2
+        r"^avanigadda[\s-]?2(\(\d+\))?$",
+        r"^sc[\s-]?avanigadda[\s-]?2(\(\d+\))?$"
     ]
 
     for p in patterns:
         if re.fullmatch(p, normalized_cell):
             return True
-
     return False
 
 
-# -------------------------------------------------------
-# Safe filename
-# -------------------------------------------------------
 def make_safe_filename(text: str) -> str:
     t = normalize(text)
     return t.replace(" ", "-")
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send an Excel file (.xlsx or .xls).")
+    await update.message.reply_text("Send me an Excel file (.xlsx or .xls).")
     return ConversationHandler.END
 
 
@@ -96,7 +76,7 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     filename = file.file_name.lower()
 
     if not (filename.endswith(".xlsx") or filename.endswith(".xls")):
-        await update.message.reply_text("Only .xlsx or .xls allowed.")
+        await update.message.reply_text("Only Excel files allowed.")
         return ConversationHandler.END
 
     user_id = update.effective_user.id
@@ -104,12 +84,12 @@ async def handle_excel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     os.makedirs(temp_dir, exist_ok=True)
 
     file_path = f"{temp_dir}/{file.file_name}"
-    f = await file.get_file()
-    await f.download_to_drive(file_path)
+    new_file = await file.get_file()
+    await new_file.download_to_drive(file_path)
 
     user_file_cache[user_id] = file_path
+    await update.message.reply_text("Excel received. Send any message to run filter:")
 
-    await update.message.reply_text("Excel received. Send ANY text to continue filtering.")
     return ASK_VALUE
 
 
@@ -119,13 +99,12 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     temp_dir = os.path.dirname(file_path)
 
     try:
-        # Pick engine
-        if file_path.endswith(".xlsx"):
+        if file_path.lower().endswith(".xlsx"):
             excel_data = pd.read_excel(file_path, sheet_name=None, engine="openpyxl")
         else:
             excel_data = pd.read_excel(file_path, sheet_name=None, engine="xlrd")
 
-        output_path = f"{temp_dir}/avanigadda-2-exact.xlsx"
+        output_path = f"{temp_dir}/avanigadda-2-filtered-flex.xlsx"
         writer = pd.ExcelWriter(output_path, engine="openpyxl")
 
         for sheet, df in excel_data.items():
@@ -136,12 +115,10 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             for idx, row in df_str.iterrows():
                 found = False
-
-                for original, norm in zip(row, df_norm.loc[idx]):
-                    if is_exact_valid_cell(original, norm):
+                for orig, norm in zip(row, df_norm.loc[idx]):
+                    if matches_strict_pattern(orig, norm):
                         found = True
                         break
-
                 matches.append(found)
 
             df_filtered = df[matches]
@@ -151,7 +128,7 @@ async def ask_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_document(
             document=open(output_path, "rb"),
-            filename="avanigadda-2-exact.xlsx"
+            filename="avanigadda-2-filtered-flex.xlsx"
         )
 
     except Exception as e:
