@@ -1,6 +1,6 @@
-python-telegram-bot==21.5
-pandas==1.5.3
-openpyxl
-xlrd==1.2.0
-numpy==1.23.5
 python-dotenv
+rapidfuzz==3.9.1
+python-telegram-bot==20.7
+openpyxl==3.1.2
+xlrd==2.0.1
+rapidfuzz==3.9.1
