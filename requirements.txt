@@ -1,7 +1,7 @@
-python-telegram-bot[webhooks]==20.7
-aiohttp==3.9.1
+python-telegram-bot==20.7
+Flask==3.1.0
+openpyxl==3.1.2
+xlrd==2.0.1
 python-dotenv
-pandas
-openpyxl
-xlrd
-rapidfuzz
+rapidfuzz==3.9.1
+gunicorn
