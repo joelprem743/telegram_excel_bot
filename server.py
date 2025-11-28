@@ -1,19 +1,24 @@
 import os
-from flask import Flask, request
-from bot import application  # import telegram application
+from bot import application
 
-TOKEN = os.getenv("TOKEN")
+if __name__ == "__main__":
+    PORT = int(os.getenv("PORT", 10000))
+    EXTERNAL = os.getenv("RENDER_EXTERNAL_URL")
 
-app = Flask(__name__)
+    if not EXTERNAL:
+        raise RuntimeError("RENDER_EXTERNAL_URL is not set")
 
-@app.post(f"/webhook/{TOKEN}")
-def webhook() -> str:
-    """Receives Telegram updates from webhook."""
-    json_data = request.get_json(force=True, silent=True)
-    if json_data:
-        application.update_queue.put(json_data)
-    return "OK", 200
+    WEBHOOK_URL = f"https://{EXTERNAL}/webhook"
 
-@app.get("/")
-def home():
-    return "Telegram Excel Bot Webhook Server Running", 200
+    print("===========================================")
+    print("Starting Telegram bot via webhook mode")
+    print("Webhook URL:", WEBHOOK_URL)
+    print("Listening on port:", PORT)
+    print("===========================================")
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        webhook_url=WEBHOOK_URL,
+        drop_pending_updates=True,
+    )

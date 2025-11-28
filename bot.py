@@ -1,33 +1,37 @@
 import os
 import logging
 from io import BytesIO
-from rapidfuzz import process, fuzz
+from dotenv import load_dotenv
 from telegram import Update
 from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ContextTypes,
-    ConversationHandler,
+    Application, CommandHandler, MessageHandler,
+    ContextTypes, ConversationHandler, filters
 )
 import openpyxl
 import xlrd
-from datetime import datetime
+from rapidfuzz import process, fuzz
+
+load_dotenv()
 
 logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    format="%(asctime)s | %(levelname)s | %(message)s",
     level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-WAITING_FILE, WAITING_COLUMN, WAITING_SEARCH, WAITING_VALUE_SELECT, WAITING_FILTER = range(5)
+WAIT_FILE, WAIT_COLUMN, WAIT_RAWVALUE, WAIT_CHOICE = range(4)
+
+TOKEN = os.getenv("TOKEN")
+if not TOKEN:
+    raise RuntimeError("TOKEN not found in environment variables")
+
+application = Application.builder().token(TOKEN).build()
 
 
-# ==================================================================
-# CLEAN LOADER (XLS + XLSX + ERROR-FIXING)
-# ==================================================================
-def load_excel_clean(file_bytes, file_name):
+# ----------------------------------------------------------------------------------------------------
+# Load XLS/XLSX safely
+# ----------------------------------------------------------------------------------------------------
+def load_excel_clean(file_bytes: bytes, file_name: str):
     ext = file_name.lower()
 
     # XLSX
@@ -35,141 +39,118 @@ def load_excel_clean(file_bytes, file_name):
         wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
         ws = wb.active
 
-        clean_wb = openpyxl.Workbook()
-        clean_ws = clean_wb.active
+        clean = openpyxl.Workbook()
+        dst = clean.active
 
         for row in ws.iter_rows(values_only=True):
-            clean_ws.append(list(_clean_row(row)))
+            dst.append(list(row))
 
-        return clean_wb
+        return clean
 
-    # XLS
+    # XLS (true or fake)
     if ext.endswith(".xls"):
         try:
             book = xlrd.open_workbook(file_contents=file_bytes)
             sheet = book.sheet_by_index(0)
 
-            clean_wb = openpyxl.Workbook()
-            clean_ws = clean_wb.active
+            clean = openpyxl.Workbook()
+            dst = clean.active
 
             for r in range(sheet.nrows):
-                clean_ws.append(_clean_row(sheet.row_values(r)))
+                dst.append(sheet.row_values(r))
 
-            return clean_wb
+            return clean
 
-        except xlrd.biffh.XLRDError:
-            # Fake XLS → actually XLSX
-            wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
-            ws = wb.active
+        except xlrd.biffh.XLRDError as e:
+            if "xlsx file; not supported" in str(e).lower():
+                wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
+                ws = wb.active
 
-            clean_wb = openpyxl.Workbook()
-            clean_ws = clean_wb.active
+                clean = openpyxl.Workbook()
+                dst = clean.active
 
-            for row in ws.iter_rows(values_only=True):
-                clean_ws.append(list(_clean_row(row)))
+                for row in ws.iter_rows(values_only=True):
+                    dst.append(list(row))
 
-            return clean_wb
+                return clean
+            raise e
 
     raise ValueError("Unsupported file type")
 
 
-# ==================================================================
-# CLEAN VALUE FIXER (DOB fix, scientific notation fix)
-# ==================================================================
-def _clean_row(row):
-    cleaned = []
-    for cell in row:
-        if cell is None:
-            cleaned.append(None)
-            continue
-
-        # Fix scientific notation numbers
-        if isinstance(cell, float) and "e" in str(cell).lower():
-            cleaned.append(str(int(cell)))
-            continue
-
-        # Fix DOB formats
-        if isinstance(cell, float):  # Excel serial date
-            try:
-                dt = datetime.fromordinal(datetime(1899, 12, 30).toordinal() + int(cell))
-                cleaned.append(dt.strftime("%Y-%m-%d"))
-                continue
-            except:
-                pass
-
-        cleaned.append(cell)
-    return cleaned
-
-
-# ==================================================================
-# BOT HANDLERS
-# ==================================================================
+# ----------------------------------------------------------------------------------------------------
+# Conversation: START
+# ----------------------------------------------------------------------------------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send an Excel file (.xls or .xlsx)\nI will clean it, fix malformed data, "
-        "and help you filter interactively."
-    )
-    return WAITING_FILE
+    await update.message.reply_text("Send an Excel file (.xls or .xlsx).")
+    return WAIT_FILE
 
 
+# ----------------------------------------------------------------------------------------------------
+# Receive file
+# ----------------------------------------------------------------------------------------------------
 async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         doc = update.message.document
-        name = doc.file_name
+        name = doc.file_name.lower()
 
         if not (name.endswith(".xls") or name.endswith(".xlsx")):
-            await update.message.reply_text("Send only .xls or .xlsx")
-            return WAITING_FILE
+            await update.message.reply_text("Only .xls or .xlsx allowed.")
+            return WAIT_FILE
 
-        tg_file = await context.bot.get_file(doc.file_id)
-        file_bytes = await tg_file.download_as_bytearray()
+        tgfile = await context.bot.get_file(doc.file_id)
+        data = await tgfile.download_as_bytearray()
 
-        wb = load_excel_clean(bytes(file_bytes), name)
+        wb = load_excel_clean(bytes(data), name)
         ws = wb.active
 
         headers = []
         for c in range(1, ws.max_column + 1):
-            h = ws.cell(1, c).value
-            headers.append(f"{c}. {h if h else 'Column ' + str(c)}")
+            headers.append(f"{c}. {ws.cell(1, c).value}")
 
         context.user_data["wb"] = wb
         context.user_data["name"] = name
-        context.user_data["max_col"] = ws.max_column
+        context.user_data["cols"] = ws.max_column
 
         await update.message.reply_text(
-            "File loaded.\nColumns:\n" +
+            "File loaded.\n\nColumns:\n" +
             "\n".join(headers) +
-            "\n\nEnter column number:"
+            "\n\nSend column number to filter."
         )
-        return WAITING_COLUMN
+        return WAIT_COLUMN
 
     except Exception as e:
         logger.error(e)
-        await update.message.reply_text("Error reading file")
-        return WAITING_FILE
+        await update.message.reply_text("Error reading file.")
+        return WAIT_FILE
 
 
+# ----------------------------------------------------------------------------------------------------
+# Receive column number
+# ----------------------------------------------------------------------------------------------------
 async def receive_column(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         col = int(update.message.text.strip())
-        if not 1 <= col <= context.user_data["max_col"]:
-            await update.message.reply_text("Invalid column number")
-            return WAITING_COLUMN
+        if not 1 <= col <= context.user_data["cols"]:
+            await update.message.reply_text("Invalid column number.")
+            return WAIT_COLUMN
 
         context.user_data["col"] = col
-        await update.message.reply_text(
-            "Enter search text (I will show similar values):"
-        )
-        return WAITING_SEARCH
+        await update.message.reply_text("Enter search text (partial allowed).")
+        return WAIT_RAWVALUE
 
     except:
-        await update.message.reply_text("Enter valid number")
-        return WAITING_COLUMN
+        await update.message.reply_text("Enter a valid number.")
+        return WAIT_COLUMN
 
 
-async def receive_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    search = update.message.text.strip().lower()
+# ----------------------------------------------------------------------------------------------------
+# Fuzzy match unique values
+# ----------------------------------------------------------------------------------------------------
+async def receive_raw_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    raw = update.message.text.strip().lower()
     col = context.user_data["col"]
+
     ws = context.user_data["wb"].active
 
     values = set()
@@ -178,97 +159,109 @@ async def receive_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if v:
             values.add(str(v).strip())
 
-    # Fuzzy match
+    values = list(values)
+
     matches = process.extract(
-        search, list(values),
+        raw,
+        values,
         scorer=fuzz.WRatio,
-        limit=10
+        limit=8
     )
 
-    top = [m[0] for m in matches if m[1] >= 60]
+    good = [m for m in matches if m[1] >= 60]
+    if not good:
+        await update.message.reply_text("No close matches found.")
+        return ConversationHandler.END
 
-    if not top:
-        await update.message.reply_text("No similar values found. Try again:")
-        return WAITING_SEARCH
+    formatted = []
+    for idx, (val, score, _) in enumerate(good, start=1):
+        formatted.append(f"{idx}. {val}")
 
-    msg = "Found similar values:\n\n"
-    for i, v in enumerate(top, 1):
-        msg += f"{i}. {v}\n"
+    context.user_data["choices"] = [v[0] for v in good]
 
-    msg += "\nSend the number of the correct value:"
-    context.user_data["options"] = top
+    await update.message.reply_text(
+        "Found multiple matches:\n" +
+        "\n".join(formatted) +
+        "\n\nSend the number of your correct value."
+    )
+    return WAIT_CHOICE
 
-    await update.message.reply_text(msg)
-    return WAITING_VALUE_SELECT
 
-
-async def receive_value_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----------------------------------------------------------------------------------------------------
+# User selects final exact match → filter rows
+# ----------------------------------------------------------------------------------------------------
+async def receive_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        idx = int(update.message.text.strip()) - 1
-        options = context.user_data["options"]
+        idx = int(update.message.text.strip())
+        choices = context.user_data["choices"]
 
-        if idx < 0 or idx >= len(options):
-            await update.message.reply_text("Invalid choice")
-            return WAITING_VALUE_SELECT
+        if not 1 <= idx <= len(choices):
+            await update.message.reply_text("Invalid choice.")
+            return WAIT_CHOICE
 
-        context.user_data["value"] = options[idx]
-        await update.message.reply_text(f"Filtering by: {options[idx]}")
-        return await filter_and_send(update, context)
+        final = choices[idx - 1].lower()
+        col = context.user_data["col"]
+        ws = context.user_data["wb"].active
 
-    except:
-        await update.message.reply_text("Enter valid number")
-        return WAITING_VALUE_SELECT
+        out = openpyxl.Workbook()
+        dst = out.active
+
+        header = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
+        dst.append(header)
+
+        count = 0
+        for r in range(2, ws.max_row + 1):
+            cell = ws.cell(r, col).value
+            if cell and str(cell).strip().lower() == final:
+                row = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
+                dst.append(row)
+                count += 1
+
+        if count == 0:
+            await update.message.reply_text("No rows found.")
+            return ConversationHandler.END
+
+        bio = BytesIO()
+        out.save(bio)
+        bio.seek(0)
+
+        base = os.path.splitext(context.user_data["name"])[0]
+        fname = f"{base}_filtered.xlsx"
+
+        await update.message.reply_document(
+            document=bio,
+            filename=fname,
+            caption=f"Done. {count} rows."
+        )
+
+        return ConversationHandler.END
+
+    except Exception as e:
+        logger.error(e)
+        await update.message.reply_text("Error.")
+        return ConversationHandler.END
 
 
-async def filter_and_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    col = context.user_data["col"]
-    value = context.user_data["value"]
-    ws = context.user_data["wb"].active
-
-    new_wb = openpyxl.Workbook()
-    new_ws = new_wb.active
-
-    # header
-    header = [ws.cell(1, c).value for c in range(1, ws.max_column + 1)]
-    new_ws.append(header)
-
-    count = 0
-    for r in range(2, ws.max_row + 1):
-        if str(ws.cell(r, col).value).strip() == value:
-            row = [ws.cell(r, c).value for c in range(1, ws.max_column + 1)]
-            new_ws.append(row)
-            count += 1
-
-    output = BytesIO()
-    new_wb.save(output)
-    output.seek(0)
-
-    base = os.path.splitext(context.user_data["name"])[0]
-    fname = f"{base}_filtered.xlsx"
-
-    await update.message.reply_document(
-        document=output,
-        filename=fname,
-        caption=f"Done. {count} matches."
-    )
+# ----------------------------------------------------------------------------------------------------
+# Cancel handler
+# ----------------------------------------------------------------------------------------------------
+async def cancel(update, context):
+    await update.message.reply_text("Canceled.")
     return ConversationHandler.END
 
 
-# ==================================================================
-# APPLICATION
-# ==================================================================
-TOKEN = os.getenv("TOKEN")
-application = Application.builder().token(TOKEN).updater(None).build()
-
+# ----------------------------------------------------------------------------------------------------
+# Add handlers
+# ----------------------------------------------------------------------------------------------------
 conv = ConversationHandler(
     entry_points=[CommandHandler("start", start)],
     states={
-        WAITING_FILE: [MessageHandler(filters.Document.ALL, receive_file)],
-        WAITING_COLUMN: [MessageHandler(filters.TEXT, receive_column)],
-        WAITING_SEARCH: [MessageHandler(filters.TEXT, receive_search)],
-        WAITING_VALUE_SELECT: [MessageHandler(filters.TEXT, receive_value_select)],
+        WAIT_FILE: [MessageHandler(filters.Document.ALL, receive_file)],
+        WAIT_COLUMN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_column)],
+        WAIT_RAWVALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_raw_value)],
+        WAIT_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_choice)],
     },
-    fallbacks=[]
+    fallbacks=[CommandHandler("cancel", cancel)],
 )
 
 application.add_handler(conv)
