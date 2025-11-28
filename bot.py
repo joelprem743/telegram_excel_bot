@@ -24,10 +24,12 @@ TOKEN = os.environ.get("TOKEN")
 if not TOKEN:
     raise SystemExit("TOKEN environment variable not set")
 
-SERVICE_URL = os.environ.get("RENDER_EXTERNAL_URL")
-if not SERVICE_URL:
-    SERVICE_NAME = os.environ.get("RENDER_SERVICE_NAME", "telegram_excel_bot")
-    SERVICE_URL = f"https://{SERVICE_NAME}.onrender.com"
+# Render always gives RENDER_EXTERNAL_HOSTNAME
+SERVICE_HOSTNAME = os.environ.get("RENDER_EXTERNAL_HOSTNAME")
+if not SERVICE_HOSTNAME:
+    raise SystemExit("RENDER_EXTERNAL_HOSTNAME is missing")
+
+SERVICE_URL = f"https://{SERVICE_HOSTNAME}"
 
 WEBHOOK_PATH = f"/webhook/{TOKEN}"
 WEBHOOK_URL = f"{SERVICE_URL}{WEBHOOK_PATH}"
@@ -98,7 +100,7 @@ def handle_document(chat, file_id, file_name):
     sess["file_name"] = file_name
     sess["state"] = S_WAITING_COLUMN
 
-    text = "Columns:\n" + "\n".join([f"{i+1}. {h}" for i,h in enumerate(headers)])
+    text = "Columns:\n" + "\n".join([f"{i+1}. {h}" for i, h in enumerate(headers)])
     bot.send_message(chat, text + "\nSend column number.")
 
 def filter_and_send(chat, sess, value):
@@ -149,8 +151,7 @@ def handle_text(chat, text):
         if not text.isdigit():
             bot.send_message(chat, "Send a number.")
             return
-        col = int(text)-1
-        sess["col"] = col
+        sess["col"] = int(text) - 1
         sess["state"] = S_WAITING_SUBSTRING
         bot.send_message(chat, "Send a substring to search.")
         return
@@ -179,7 +180,7 @@ def handle_text(chat, text):
         bot.send_message(
             chat,
             "Found multiple:\n" +
-            "\n".join([f"{i+1}. {v}" for i,v in enumerate(values)]) +
+            "\n".join([f"{i+1}. {v}" for i, v in enumerate(values)]) +
             "\nSend number."
         )
         return
@@ -188,13 +189,12 @@ def handle_text(chat, text):
         if not text.isdigit():
             bot.send_message(chat, "Send a number.")
             return
-        i = int(text)-1
+        idx = int(text) - 1
         values = sess["candidates"]
-        if i < 0 or i >= len(values):
+        if idx < 0 or idx >= len(values):
             bot.send_message(chat, "Invalid choice.")
             return
-        filter_and_send(chat, sess, values[i])
-        return
+        filter_and_send(chat, sess, values[idx])
 
 @app.post(WEBHOOK_PATH)
 def webhook():
@@ -204,8 +204,11 @@ def webhook():
     if update.message:
         chat = update.message.chat.id
         if update.message.document:
-            handle_document(chat, update.message.document.file_id,
-                            update.message.document.file_name)
+            handle_document(
+                chat,
+                update.message.document.file_id,
+                update.message.document.file_name
+            )
         elif update.message.text:
             handle_text(chat, update.message.text)
 
