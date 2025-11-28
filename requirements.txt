@@ -1,7 +1,5 @@
-python-telegram-bot==20.7
 Flask==3.1.0
+python-telegram-bot==13.15
 openpyxl==3.1.2
-xlrd==2.0.1
-python-dotenv
-rapidfuzz==3.9.1
-gunicorn
+xlrd==1.2.0
+gunicorn==23.0.0
