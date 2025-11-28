@@ -241,7 +241,13 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 def main() -> None:
     """Start the bot."""
     # Replace 'YOUR_BOT_TOKEN' with your actual bot token from @BotFather
-    BOT_TOKEN = "8445817821:AAFBpG_68KDOWddpEGyqGW1mIup6XGhVl7Q"
+    from dotenv import load_dotenv
+    import os
+
+    load_dotenv()  # loads .env from the project root
+
+    BOT_TOKEN = os.getenv("TOKEN")
+    
     
     # Create application
     application = Application.builder().token(BOT_TOKEN).build()
