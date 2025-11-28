@@ -6,7 +6,10 @@ if __name__ == "__main__":
     EXTERNAL = os.getenv("RENDER_EXTERNAL_URL")
 
     if not EXTERNAL:
-        raise RuntimeError("RENDER_EXTERNAL_URL is not set")
+        raise RuntimeError("RENDER_EXTERNAL_URL not set")
+
+    # Normalize: remove https:// if user included it
+    EXTERNAL = EXTERNAL.replace("https://", "").replace("http://", "")
 
     WEBHOOK_URL = f"https://{EXTERNAL}/webhook"
 
