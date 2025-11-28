@@ -1,5 +1,8 @@
-python-telegram-bot[webhooks]==20.7
-openpyxl==3.1.2
-xlrd==2.0.1
-rapidfuzz==3.9.1
+Flask==3.0.3
 python-dotenv==1.0.1
+python-telegram-bot[webhooks]==20.7
+pandas==1.5.3
+openpyxl==3.1.2
+rapidfuzz==3.9.1
+xlrd==2.0.1
+gunicorn==21.2.0
