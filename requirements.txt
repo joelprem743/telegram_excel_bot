@@ -1,6 +1,4 @@
-python-dotenv
-rapidfuzz==3.9.1
-python-telegram-bot==20.7
-openpyxl==3.1.2
+flask
+python-telegram-bot==21.5
+openpyxl
 xlrd==2.0.1
-rapidfuzz==3.9.1

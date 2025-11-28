@@ -1,429 +1,409 @@
 # bot.py
 import os
 import logging
+import traceback
 from io import BytesIO
-from datetime import datetime, timedelta
-from typing import List, Any
-from dotenv import load_dotenv
+from datetime import datetime, date
 
-from telegram import Update
-from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    ContextTypes, ConversationHandler
-)
-
+from flask import Flask, request, abort
+from telegram import Bot, Update, InputFile
 import openpyxl
 import xlrd
-from rapidfuzz import process, fuzz  # for ranking found values (optional but recommended)
 
-logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    level=logging.INFO
-)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-# Conversation states
-WAITING_FILE, WAITING_COLUMN, WAITING_QUERY, WAITING_SELECT = range(4)
+# States
+S_WAITING_FILE = "WAITING_FILE"
+S_WAITING_COLUMN = "WAITING_COLUMN"
+S_WAITING_SUBSTRING = "WAITING_SUBSTRING"
+S_WAITING_PICK = "WAITING_PICK"   # user picks one of candidate full-values
+S_WAITING_CONFIRM = "WAITING_CONFIRM"
 
-# --- Utility helpers -------------------------------------------------------
-def is_integer_like_number(v: Any) -> bool:
-    try:
-        if isinstance(v, float):
-            return v.is_integer()
-        if isinstance(v, int):
-            return True
-    except Exception:
-        return False
-    return False
+# in-memory session store: chat_id -> dict
+# For production consider persistent storage (redis) if you need reliability across restarts.
+sessions = {}
 
-def format_number_no_scientific(v: Any) -> str:
+app = Flask(__name__)
+
+TOKEN = os.environ.get("TOKEN")
+if not TOKEN:
+    logger.error("TOKEN environment variable not set. Set TOKEN in Render environment.")
+    raise SystemExit("TOKEN not set")
+
+SERVICE_NAME = os.environ.get("RENDER_SERVICE_NAME", "telegram_excel_bot")
+# webhook path will be /webhook/<TOKEN>
+WEBHOOK_PATH = f"/webhook/{TOKEN}"
+WEBHOOK_URL = f"https://{SERVICE_NAME}.onrender.com{WEBHOOK_PATH}"
+
+bot = Bot(token=TOKEN)
+
+
+# -------------------------
+# Utilities
+# -------------------------
+def stringify_cell(val):
+    """Return a cleaned string representation for cells:
+       - dates => DD-MM-YYYY
+       - floats that are ints => as int without scientific notation
+       - other values => str trimmed
     """
-    Convert large numeric floats/ints to human-readable integer strings to avoid scientific notation.
-    Leaves non-numeric values untouched.
-    """
-    if v is None:
+    if val is None:
         return ""
-    if isinstance(v, int):
-        return str(v)
-    if isinstance(v, float):
-        if v.is_integer():
-            return str(int(v))
+    # Excel stores dates as datetime objects in openpyxl
+    if isinstance(val, (datetime, date)):
+        return val.strftime("%d-%m-%Y")
+    # xlrd may return float for dates if not parsed; we don't try to detect excel date floats here
+    # If it's a float that is a whole number, convert to int to avoid scientific notation
+    if isinstance(val, float):
+        # big integer-like floats should be represented without decimals
+        if val.is_integer():
+            return str(int(val))
         else:
-            # For non-integer floats, keep as-is but avoid scientific notation
-            return format(v, "f").rstrip("0").rstrip(".")
-    # if it's string already, just return
-    return str(v)
+            # format with no scientific notation, up to 12 decimals trimmed
+            return format(val, "f").rstrip("0").rstrip(".")
+    # If it's numeric (int)
+    if isinstance(val, int):
+        return str(val)
+    # Otherwise string-like
+    s = str(val).strip()
+    return s
 
-def parse_possible_date(value: Any):
+
+def load_excel_clean(file_bytes: bytes, file_name: str):
     """
-    Try to detect if value is a date (datetime, excel serial float, or common date-like string).
-    Returns a datetime on success, else None.
+    Returns a tuple (rows_list, headers_list)
+    - rows_list: list of rows, each row is list of cleaned values (stringified)
+    - headers_list: list of header column values (string)
+    Supports .xlsx (openpyxl), .xls (xlrd), and ".xls" that are actually xlsx (caught).
     """
-    if value is None:
-        return None
+    ext = file_name.lower()
+    rows = []
+    headers = []
 
-    # If it's already a datetime
-    if isinstance(value, datetime):
-        return value
-
-    # If it's a float/int numeric that might be an Excel serial (e.g., 45000)
-    # We'll treat large integers as not dates (e.g., RCHID). Heuristic:
-    # typical Excel serial for dates (1900 system) are numbers ~ 20000-50000 (2000-2037)
-    try:
-        if isinstance(value, (int, float)):
-            # ignore extremely large numbers that are likely IDs (e.g. > 1e6)
-            if 1000 < value < 100000:
-                # try Excel 1900 serial -> python datetime
-                try:
-                    # xlrd and openpyxl use different base; here we use xlrd's conversion
-                    # but only if xlrd is available
-                    # Note: if the original was loaded via xlrd it may already be converted earlier.
-                    dt = xlrd.xldate.xldate_as_datetime(value, 0)  # 0==1900-based
-                    return dt
-                except Exception:
-                    # fallback: try to interpret as ordinal (datetime.fromordinal won't be correct)
-                    pass
-    except Exception:
-        pass
-
-    # If it's a string, attempt parsing with common patterns
-    if isinstance(value, str):
-        s = value.strip()
-        # common formats to attempt:
-        fmts = [
-            "%Y-%m-%d %H:%M:%S",
-            "%Y-%m-%d",
-            "%d-%m-%Y",
-            "%d/%m/%Y",
-            "%Y/%m/%d",
-            "%d-%b-%Y",
-            "%d %b %Y",
-            "%m/%d/%Y",
-            "%Y.%m.%d %H:%M:%S",
-            "%Y.%m.%d"
-        ]
-        for f in fmts:
-            try:
-                return datetime.strptime(s, f)
-            except Exception:
-                continue
-        # try parsing ISOlike '2024-10-04T00:00:00' without timezone
-        try:
-            if "t" in s.lower():
-                return datetime.fromisoformat(s)
-        except Exception:
-            pass
-
-    return None
-
-def format_cell_for_output(value: Any) -> Any:
-    """
-    Convert a cell value to a safe representation for writing into the output Excel:
-    - dates -> DD-MM-YYYY string
-    - large numeric ids -> integer string (no scientific)
-    - other -> kept as-is
-    """
-    if value is None:
-        return None
-
-    # If value is datetime
-    if isinstance(value, datetime):
-        return value.strftime("%d-%m-%Y")
-
-    # If value is numeric but likely an ID or phone number -> string without scientific notation
-    if isinstance(value, (int, float)) and (is_integer_like_number(value)):
-        # If it looks small (< 1e6) it might be a normal number; still safe to convert to int
-        v_int = int(value)
-        # Heuristic: if v_int looks like a date ordinal (less than 100000) we shouldn't convert blindly
-        # We'll attempt to detect date first, above.
-        return str(v_int)
-
-    # Try parse string-as-date
-    possible_date = parse_possible_date(value)
-    if possible_date:
-        return possible_date.strftime("%d-%m-%Y")
-
-    # Fallback for strings: remove non-printable, strip
-    if isinstance(value, str):
-        return value.strip()
-
-    # For other types, convert to string
-    return str(value)
-
-# --- Excel loader that returns a clean openpyxl workbook --------------------
-def load_excel_clean(file_bytes: bytes, file_name: str) -> openpyxl.Workbook:
-    """
-    Load given bytes from .xls or .xlsx into an openpyxl Workbook containing only raw values.
-    Handles real .xls (via xlrd), real .xlsx (openpyxl) and mis-labeled '.xls' that are xlsx files.
-    """
-    lower = file_name.lower()
-    if lower.endswith(".xlsx"):
+    if ext.endswith(".xlsx"):
         wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
         ws = wb.active
-        clean_wb = openpyxl.Workbook()
-        clean_ws = clean_wb.active
-        for row in ws.iter_rows(values_only=True):
-            clean_ws.append([cell for cell in row])
-        return clean_wb
+        # iterate rows values_only to get native Python values, then stringify
+        rows_iter = list(ws.iter_rows(values_only=True))
+        if not rows_iter:
+            return [], []
+        headers = [stringify_cell(v) or f"Column {i+1}" for i, v in enumerate(rows_iter[0])]
+        for r in rows_iter[1:]:
+            rows.append([stringify_cell(v) for v in r])
+        return rows, headers
 
-    if lower.endswith(".xls"):
-        # try reading with xlrd first
+    elif ext.endswith(".xls"):
         try:
             book = xlrd.open_workbook(file_contents=file_bytes)
             sheet = book.sheet_by_index(0)
-            clean_wb = openpyxl.Workbook()
-            clean_ws = clean_wb.active
-            for r in range(sheet.nrows):
-                # xlrd returns numbers/dates as floats/tuples; we keep raw values for later conversion
-                clean_ws.append(sheet.row_values(r))
-            return clean_wb
+            if sheet.nrows == 0:
+                return [], []
+            # first row = headers
+            headers = [stringify_cell(sheet.cell_value(0, c)) or f"Column {c+1}" for c in range(sheet.ncols)]
+            for r in range(1, sheet.nrows):
+                row_vals = [stringify_cell(sheet.cell_value(r, c)) for c in range(sheet.ncols)]
+                rows.append(row_vals)
+            return rows, headers
         except xlrd.biffh.XLRDError as e:
-            # If xlrd complains "Excel xlsx file; not supported" attempt to load as xlsx (file mislabeled)
-            if "xlsx file; not supported" in str(e).lower():
+            # handle disguised xlsx saved with .xls extension
+            msg = str(e).lower()
+            if "xlsx file; not supported" in msg or "expected xls workbook" in msg:
+                # try openpyxl
                 wb = openpyxl.load_workbook(BytesIO(file_bytes), data_only=True)
                 ws = wb.active
-                clean_wb = openpyxl.Workbook()
-                clean_ws = clean_wb.active
-                for row in ws.iter_rows(values_only=True):
-                    clean_ws.append([cell for cell in row])
-                return clean_wb
-            # otherwise re-raise
+                rows_iter = list(ws.iter_rows(values_only=True))
+                if not rows_iter:
+                    return [], []
+                headers = [stringify_cell(v) or f"Column {i+1}" for i, v in enumerate(rows_iter[0])]
+                for r in rows_iter[1:]:
+                    rows.append([stringify_cell(v) for v in r])
+                return rows, headers
             raise
 
-    raise ValueError("Unsupported file type. Send .xls or .xlsx")
+    else:
+        raise ValueError("Unsupported file type. Use .xls or .xlsx")
 
-# --- Bot handlers ----------------------------------------------------------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Send an Excel file (.xls or .xlsx). I'll strip formatting and work with values-only.\n\n"
-        "Flow:\n"
-        "1) You upload file\n"
-        "2) You pick a column number\n"
-        "3) You type a partial search string (e.g. 'avanigadda')\n"
-        "4) I show matching distinct values from that column and you pick the exact entry\n"
-        "5) I return an .xlsx with header + all rows that contain the chosen entry (substring match)\n\n"
-        "Send /cancel at any time to stop."
-    )
-    return WAITING_FILE
 
-async def receive_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        doc = update.message.document
-        if not doc:
-            await update.message.reply_text("No file detected. Send an Excel document (.xls or .xlsx).")
-            return WAITING_FILE
-
-        fname = doc.file_name
-        if not (fname.lower().endswith(".xls") or fname.lower().endswith(".xlsx")):
-            await update.message.reply_text("Please send only .xls or .xlsx files.")
-            return WAITING_FILE
-
-        tgfile = await context.bot.get_file(doc.file_id)
-        fb = await tgfile.download_as_bytearray()
-
-        # Load clean workbook
-        wb = load_excel_clean(bytes(fb), fname)
-        ws = wb.active
-
-        # Save to user_data
-        context.user_data["wb"] = wb
-        context.user_data["file_name"] = fname
-        context.user_data["max_col"] = ws.max_column
-
-        # Build simple column list (1-indexed)
-        headers = []
-        for col in range(1, ws.max_column + 1):
-            v = ws.cell(1, col).value
-            if v is None:
-                headers.append(f"{col}. Column {openpyxl.utils.get_column_letter(col)}")
-            else:
-                headers.append(f"{col}. {str(v)}")
-
-        await update.message.reply_text(
-            "File loaded. Detected columns:\n\n" + "\n".join(headers) +
-            f"\n\nReply with the column *number* you want to search (1 - {ws.max_column}).",
-            parse_mode="Markdown"
-        )
-        return WAITING_COLUMN
-    except Exception as e:
-        logger.exception("Error in receive_file")
-        await update.message.reply_text(f"Error reading file: {e}\nSend a valid .xls or .xlsx.")
-        return WAITING_FILE
-
-async def receive_column(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    try:
-        c = int(txt)
-    except Exception:
-        await update.message.reply_text("Please send a valid column number.")
-        return WAITING_COLUMN
-
-    if "max_col" not in context.user_data or c < 1 or c > context.user_data["max_col"]:
-        await update.message.reply_text(f"Invalid column number. Enter 1 to {context.user_data.get('max_col','?')}.")
-        return WAITING_COLUMN
-
-    context.user_data["col"] = c
-    await update.message.reply_text(
-        "Enter a search string (partial match). I will show all distinct column values that contain this substring."
-    )
-    return WAITING_QUERY
-
-async def receive_query(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.message.text.strip()
-    if not query:
-        await update.message.reply_text("Send a non-empty search string.")
-        return WAITING_QUERY
-
-    wb: openpyxl.Workbook = context.user_data["wb"]
+def build_output_workbook(header_row, rows_to_write):
+    """Return BytesIO containing an .xlsx workbook with header_row and rows_to_write"""
+    wb = openpyxl.Workbook()
     ws = wb.active
-    col = context.user_data["col"]
-
-    # collect distinct values from column
-    seen = {}
-    for r in range(2, ws.max_row + 1):
-        raw = ws.cell(r, col).value
-        if raw is None:
-            continue
-        # create normalized key for matching (lower)
-        norm = str(raw).strip().lower()
-        if query.lower() in norm:
-            if norm not in seen:
-                seen[norm] = str(raw).strip()
-
-    if not seen:
-        await update.message.reply_text(f"No values in column {col} contain '{query}'. Try another search or /start again.")
-        return ConversationHandler.END
-
-    # Rank candidates: use rapidfuzz to sort best matches first (optional)
-    choices = list(seen.values())
-    # We rank by fuzzy partial_ratio against the query
-    ranked = process.extract(query, choices, scorer=fuzz.partial_ratio, limit=200)
-    # ranked is list of tuples (choice, score, index)
-    ordered_choices = [t[0] for t in ranked]
-
-    # limit the number of presented options
-    MAX_CHOICES = 40
-    presented = ordered_choices[:MAX_CHOICES]
-
-    # store mapping to allow selection
-    context.user_data["candidates"] = presented
-
-    # prepare message chunked if many
-    lines = [f"Found {len(seen)} distinct matching values. Showing top {len(presented)}:"]
-    for i, v in enumerate(presented, start=1):
-        lines.append(f"{i}. {v}")
-
-    lines.append("\nReply with the number of the correct value (or 0 to cancel).")
-    await update.message.reply_text("\n".join(lines))
-    return WAITING_SELECT
-
-async def receive_select(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip()
-    if not txt.isdigit():
-        await update.message.reply_text("Please reply with the number of the value you want (e.g. 2).")
-        return WAITING_SELECT
-    idx = int(txt)
-    if idx == 0:
-        await update.message.reply_text("Cancelled. Send /start to begin again.")
-        return ConversationHandler.END
-
-    candidates: List[str] = context.user_data.get("candidates", [])
-    if idx < 1 or idx > len(candidates):
-        await update.message.reply_text(f"Invalid selection. Choose a number between 1 and {len(candidates)}.")
-        return WAITING_SELECT
-
-    chosen = candidates[idx - 1]
-    context.user_data["chosen_value"] = chosen
-
-    # Now perform the filtering: rows where chosen is substring of the selected column cell (case-insensitive)
-    wb: openpyxl.Workbook = context.user_data["wb"]
-    ws = wb.active
-    col = context.user_data["col"]
-
-    # Prepare output workbook
-    out_wb = openpyxl.Workbook()
-    out_ws = out_wb.active
-    out_ws.title = "Filtered"
-
-    # copy header row while formatting header as string
-    header_row = []
-    for c in range(1, ws.max_column + 1):
-        header_row.append(str(ws.cell(1, c).value) if ws.cell(1, c).value is not None else "")
-    out_ws.append(header_row)
-
-    match_count = 0
-    for r in range(2, ws.max_row + 1):
-        val = ws.cell(r, col).value
-        if val is None:
-            continue
-        if chosen.strip().lower() in str(val).strip().lower():
-            # copy entire row, formatting each cell
-            formatted_row = [format_cell_for_output(ws.cell(r, c).value) for c in range(1, ws.max_column + 1)]
-            out_ws.append(formatted_row)
-            match_count += 1
-
-    if match_count == 0:
-        await update.message.reply_text(f"No rows found containing '{chosen}' — this is unexpected. Try /start.")
-        return ConversationHandler.END
-
-    # Ensure column widths are reasonable (basic heuristic)
-    for c in range(1, ws.max_column + 1):
-        letter = openpyxl.utils.get_column_letter(c)
+    ws.title = "Filtered"
+    ws.append(header_row)
+    for row in rows_to_write:
+        # ensure row length matches header length by padding with empty strings
+        if len(row) < len(header_row):
+            row = row + [""] * (len(header_row) - len(row))
+        ws.append(row)
+    # Basic column width adjust
+    for col_idx in range(1, ws.max_column + 1):
         max_len = 0
-        for row in out_ws.iter_rows(min_col=c, max_col=c):
-            for cell in row:
-                if cell.value is None:
-                    continue
-                l = len(str(cell.value))
-                if l > max_len:
-                    max_len = l
-        out_ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 60)
+        for r in range(1, ws.max_row + 1):
+            cell = ws.cell(r, col_idx).value
+            if cell is None:
+                continue
+            l = len(str(cell))
+            if l > max_len:
+                max_len = l
+        width = min(max(8, max_len + 2), 50)
+        ws.column_dimensions[openpyxl.utils.get_column_letter(col_idx)].width = width
 
-    # Save to BytesIO and send
-    output = BytesIO()
-    out_wb.save(output)
-    output.seek(0)
+    bio = BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
 
-    base = os.path.splitext(context.user_data.get("file_name", "filtered"))[0]
-    out_name = f"{base}_filtered_by_{col}_{chosen[:30].replace(' ', '_')}.xlsx"
 
-    await update.message.reply_document(
-        document=output,
-        filename=out_name,
-        caption=f"Filtered file ready — {match_count} rows matched '{chosen}'."
+# -------------------------
+# Bot interaction helpers
+# -------------------------
+def init_session(chat_id):
+    sessions[chat_id] = {
+        "state": S_WAITING_FILE,
+        "file_name": None,
+        "headers": None,
+        "rows": None,         # list of rows (each row is list of strings)
+        "max_col": 0,
+        "chosen_col": None,
+        "candidates": None,   # list of distinct matching full-values for substring
+    }
+    return sessions[chat_id]
+
+
+def get_session(chat_id):
+    return sessions.get(chat_id) or init_session(chat_id)
+
+
+def cleanup_session(chat_id):
+    if chat_id in sessions:
+        del sessions[chat_id]
+
+
+# -------------------------
+# Handlers (message processing)
+# -------------------------
+def handle_start(chat_id):
+    init_session(chat_id)
+    text = (
+        "Send an Excel file (.xls or .xlsx). I will strip formatting and process raw values.\n\n"
+        "If your file is .xls but actually an xlsx, the loader handles that automatically."
     )
-    return ConversationHandler.END
+    bot.send_message(chat_id=chat_id, text=text)
 
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Operation cancelled. Send /start to begin again.")
-    return ConversationHandler.END
 
-# --- Main -----------------------------------------------------------------
-def main():
-    load_dotenv() 
-    TOKEN = os.getenv("TOKEN")
-    if not TOKEN:
-        logger.error("TOKEN env var not set. Set TOKEN in environment and restart.")
-        raise SystemExit("TOKEN env var not set. Set TOKEN in environment and restart.")
+def handle_document(chat_id, file_id, file_name):
+    sess = get_session(chat_id)
+    try:
+        logger.info("Downloading file %s for chat %s", file_name, chat_id)
+        f = bot.get_file(file_id)
+        data = f.download_as_bytearray()
+        rows, headers = load_excel_clean(bytes(data), file_name)
 
-    application = Application.builder().token(TOKEN).build()
+        if not headers:
+            bot.send_message(chat_id=chat_id, text="Could not find headers or the file is empty. Send another file.")
+            return
 
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            WAITING_FILE: [MessageHandler(filters.Document.ALL, receive_file)],
-            WAITING_COLUMN: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_column)],
-            WAITING_QUERY: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_query)],
-            WAITING_SELECT: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_select)]
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True
-    )
+        sess["file_name"] = file_name
+        sess["headers"] = headers
+        sess["rows"] = rows
+        sess["max_col"] = len(headers)
+        sess["state"] = S_WAITING_COLUMN
 
-    application.add_handler(conv)
+        # present headers with numbers
+        lines = [f"{i+1}. {h}" for i, h in enumerate(headers)]
+        bot.send_message(
+            chat_id=chat_id,
+            text=f"File loaded. Found {len(headers)} columns:\n\n" + "\n".join(lines) + "\n\nSend column number to filter by."
+        )
+    except Exception as e:
+        logger.exception("Error reading file")
+        bot.send_message(chat_id=chat_id, text=f"Error reading file: {e}")
 
-    logger.info("Bot starting (polling)...")
-    application.run_polling()
+
+def handle_text(chat_id, text):
+    sess = get_session(chat_id)
+    state = sess["state"]
+
+    if text.strip().startswith("/start"):
+        handle_start(chat_id)
+        return
+
+    # CANCEL
+    if text.strip().lower() in ("/cancel", "cancel", "stop"):
+        cleanup_session(chat_id)
+        bot.send_message(chat_id=chat_id, text="Operation cancelled. Send /start to begin again.")
+        return
+
+    # State machine
+    if state == S_WAITING_FILE:
+        bot.send_message(chat_id=chat_id, text="Please send an Excel file (.xls or .xlsx) first.")
+        return
+
+    if state == S_WAITING_COLUMN:
+        # Expect numeric column index
+        try:
+            col = int(text.strip())
+            if not (1 <= col <= sess["max_col"]):
+                bot.send_message(chat_id=chat_id, text=f"Invalid column number. Choose 1..{sess['max_col']}")
+                return
+            sess["chosen_col"] = col - 1  # store 0-based index
+            sess["state"] = S_WAITING_SUBSTRING
+            bot.send_message(chat_id=chat_id, text=f"Column {col} selected ({sess['headers'][col-1]}). Now send a substring to search for (loose match).")
+            return
+        except ValueError:
+            bot.send_message(chat_id=chat_id, text="Please send a valid column number.")
+            return
+
+    if state == S_WAITING_SUBSTRING:
+        # user sent substring to search: find distinct values in chosen column that contain substring (case-insensitive)
+        substr = text.strip().lower()
+        col_idx = sess["chosen_col"]
+        values = []
+        for row in sess["rows"]:
+            # protect for rows shorter than expected
+            v = row[col_idx] if col_idx < len(row) else ""
+            s = (v or "").strip()
+            if substr in s.lower():
+                values.append(s)
+        distinct = []
+        seen = set()
+        for v in values:
+            if v not in seen:
+                seen.add(v)
+                distinct.append(v)
+        if not distinct:
+            bot.send_message(chat_id=chat_id, text=f"No column values contain '{text}'. Send another substring or /cancel.")
+            return
+        # If only one match, proceed directly to filter
+        if len(distinct) == 1:
+            chosen_full = distinct[0]
+            bot.send_message(chat_id=chat_id, text=f"Found single match: {chosen_full}. Filtering rows now...")
+            do_filter_and_send(chat_id, sess, chosen_full)
+            cleanup_session(chat_id)
+            return
+        # Many candidates: present numbered list for user to pick
+        sess["candidates"] = distinct
+        sess["state"] = S_WAITING_PICK
+        lines = [f"{i+1}. {v}" for i, v in enumerate(distinct)]
+        bot.send_message(chat_id=chat_id, text="Found multiple matches:\n" + "\n".join(lines) + "\n\nSend the number of the correct value.")
+        return
+
+    if state == S_WAITING_PICK:
+        # Expect user to pick number of candidate
+        try:
+            n = int(text.strip())
+            cand = sess.get("candidates") or []
+            if not (1 <= n <= len(cand)):
+                bot.send_message(chat_id=chat_id, text=f"Invalid selection. Send a number between 1 and {len(cand)}.")
+                return
+            chosen_full = cand[n-1]
+            bot.send_message(chat_id=chat_id, text=f"You selected: {chosen_full}. Filtering rows now...")
+            do_filter_and_send(chat_id, sess, chosen_full)
+            cleanup_session(chat_id)
+            return
+        except ValueError:
+            bot.send_message(chat_id=chat_id, text="Send the number of the desired value (e.g. 2).")
+            return
+
+    # fallback
+    bot.send_message(chat_id=chat_id, text="I didn't understand that. Send /start to begin.")
+
+
+def do_filter_and_send(chat_id, sess, chosen_full_value):
+    """Filter sess['rows'] where chosen_col equals chosen_full_value (string compare) and send an xlsx to user."""
+    try:
+        col_idx = sess["chosen_col"]
+        header = sess["headers"]
+        rows = sess["rows"]
+
+        filtered = []
+        for r in rows:
+            v = r[col_idx] if col_idx < len(r) else ""
+            if (v or "").strip().lower() == chosen_full_value.strip().lower():
+                filtered.append(r)
+
+        if not filtered:
+            bot.send_message(chat_id=chat_id, text=f"No rows found for value '{chosen_full_value}'.")
+            return
+
+        # Build workbook and send
+        bio = build_output_workbook(header, filtered)
+        filename_base = os.path.splitext(sess.get("file_name", "output"))[0]
+        out_name = f"{filename_base}_filtered.xlsx"
+
+        # Telegram InputFile
+        bio.seek(0)
+        bot.send_document(chat_id=chat_id, document=InputFile(bio, filename=out_name),
+                          caption=f"Filtered results: {len(filtered)} rows for '{chosen_full_value}'.")
+    except Exception:
+        logger.exception("Error while filtering/sending file")
+        bot.send_message(chat_id=chat_id, text="Error while filtering or sending file.")
+
+
+# -------------------------
+# Flask webhook endpoint
+# -------------------------
+@app.route(WEBHOOK_PATH, methods=["POST"])
+def webhook():
+    # Security: verify token in path; Telegram posts here.
+    try:
+        if request.headers.get("content-type", "").startswith("application/json"):
+            data = request.get_json(force=True)
+        else:
+            data = request.get_json(force=True)
+    except Exception:
+        logger.exception("Invalid request to webhook")
+        abort(400)
+
+    try:
+        update = Update.de_json(data, bot)
+    except Exception:
+        # not a Telegram update
+        logger.exception("Failed parsing Update")
+        return "ok"
+
+    # handle message updates only
+    if update.message:
+        chat_id = update.effective_chat.id
+        # ensure session exists
+        sess = get_session(chat_id)
+        # handle document
+        if update.message.document:
+            file_id = update.message.document.file_id
+            file_name = update.message.document.file_name or "file"
+            handle_document(chat_id, file_id, file_name)
+            return "ok"
+        # handle text
+        if update.message.text:
+            text = update.message.text
+            handle_text(chat_id, text)
+            return "ok"
+        # file types we don't support
+        bot.send_message(chat_id=chat_id, text="Unsupported message type. Send an Excel document or /start.")
+        return "ok"
+
+    # callback_query, edited_message, etc are ignored for now
+    return "ok"
+
+
+# -------------------------
+# Start & webhook registration
+# -------------------------
+def set_webhook():
+    try:
+        # set webhook to the /webhook/<TOKEN> path
+        logger.info("Setting webhook to %s", WEBHOOK_URL)
+        ok = bot.set_webhook(WEBHOOK_URL)
+        logger.info("Webhook set: %s", ok)
+    except Exception:
+        logger.exception("Failed to set webhook")
+
 
 if __name__ == "__main__":
-    main()
+    # register webhook on start
+    set_webhook()
+    port = int(os.environ.get("PORT", 10000))
+    # render provides $PORT for web service; listening on 0.0.0.0 required
+    logger.info("Starting Flask on port %s", port)
+    app.run(host="0.0.0.0", port=port)
