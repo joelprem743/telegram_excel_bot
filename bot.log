@@ -1,0 +1,25 @@
+2025-12-01 19:46:54,551 - __main__ - INFO - No WEBHOOK_BASE_URL configured. Starting in polling mode.
+2025-12-01 19:47:00,232 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:06,094 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:11,954 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:19,079 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:26,819 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:37,102 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:47:49,442 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:48:07,229 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:48:12,593 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:48:18,459 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:48:25,082 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
+2025-12-01 19:48:32,810 - __main__ - ERROR - Unhandled exception: Conflict: terminated by other getUpdates request; make sure that only one bot instance is running
+NoneType: None
